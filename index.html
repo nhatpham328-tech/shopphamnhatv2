@@ -828,7 +828,17 @@
           .eq('id', session.user.id)
           .maybeSingle();
 
-        if (profErr || !profileData) return;
+        if (profErr) {
+          console.error('[Shop Phạm Nhật] Không tải được hồ sơ:', profErr);
+          UIHelperModule.toast('Không tải được hồ sơ thành viên: ' + profErr.message, 'error');
+          this.state.profile = null;
+          return false;
+        }
+        if (!profileData) {
+          UIHelperModule.toast('Tài khoản chưa có hồ sơ trong hệ thống. Vui lòng liên hệ Admin.', 'error');
+          this.state.profile = null;
+          return false;
+        }
 
         // Kiểm tra nếu tài khoản bị Ban -> tự động đăng xuất
         if (profileData.banned) {
@@ -836,15 +846,28 @@
           this.state.user = null;
           this.state.profile = null;
           UIHelperModule.toast('🚫 Tài khoản của bạn đã bị Admin khóa (Ban)!', 'error');
-          return;
+          return false;
+        }
+
+        // Số dư được lưu trong wallets; profiles chỉ chứa thông tin hồ sơ.
+        const { data: walletData, error: walletErr } = await supabaseClient
+          .from('wallets')
+          .select('balance')
+          .eq('user_id', session.user.id)
+          .maybeSingle();
+        if (walletErr) {
+          console.error('[Shop Phạm Nhật] Không tải được ví:', walletErr);
+          UIHelperModule.toast('Không tải được số dư ví: ' + walletErr.message, 'error');
+          this.state.profile = null;
+          return false;
         }
 
         this.state.profile = {
           id: profileData.id,
-          name: profileData.name,
-          email: profileData.email,
+          name: profileData.display_name || session.user.user_metadata?.name || session.user.email || 'Thành viên',
+          email: session.user.email || '',
           role: profileData.role,
-          balance: Number(profileData.balance) || 0,
+          balance: Number(walletData?.balance) || 0,
           totalSpent: Number(profileData.total_spent) || 0,
           banned: Boolean(profileData.banned)
         };
@@ -869,6 +892,7 @@
         if (this.state.profile.role === 'admin') {
           await this.refreshAllUsers();
         }
+        return true;
       },
 
       async refreshOrders() {
@@ -929,12 +953,19 @@
           .order('created_at', { ascending: false });
 
         if (usersData) {
+          const ids = usersData.map(u => u.id);
+          const { data: walletsData, error: walletsErr } = ids.length
+            ? await supabaseClient.from('wallets').select('user_id,balance').in('user_id', ids)
+            : { data: [], error: null };
+          if (walletsErr) console.error('[Shop Phạm Nhật] Không tải được danh sách ví:', walletsErr);
+          const walletMap = new Map((walletsData || []).map(w => [w.user_id, Number(w.balance) || 0]));
           this.state.allUsers = usersData.map(u => ({
             id: u.id,
-            name: u.name,
-            email: u.email,
+            name: u.display_name || 'Thành viên',
+            // Email thuộc Supabase Auth, không có trong bảng profiles và không đọc được qua API public.
+            email: '',
             role: u.role,
-            balance: Number(u.balance) || 0,
+            balance: walletMap.get(u.id) || 0,
             totalSpent: Number(u.total_spent) || 0,
             banned: Boolean(u.banned)
           }));
@@ -1145,51 +1176,76 @@
 
       async handleSubmit(e) {
         e.preventDefault();
-        const email = document.getElementById('auth-email-input').value.trim();
+        const email = document.getElementById('auth-email-input').value.trim().toLowerCase();
         const password = document.getElementById('auth-pass-input').value;
         const name = document.getElementById('auth-name-input').value.trim();
         const submitBtn = document.getElementById('auth-submit-btn');
 
+        if (!email) {
+          UIHelperModule.toast('Vui lòng nhập email hợp lệ.', 'error');
+          return;
+        }
+        if (!password || password.length < 6) {
+          UIHelperModule.toast('Mật khẩu cần có ít nhất 6 ký tự.', 'error');
+          return;
+        }
+        if (this.mode === 'register' && !name) {
+          UIHelperModule.toast('Vui lòng nhập tên hiển thị!', 'error');
+          return;
+        }
+
         submitBtn.disabled = true;
+        const originalText = submitBtn.textContent;
         submitBtn.textContent = 'Đang xử lý...';
 
         try {
           if (this.mode === 'register') {
-            if (!name) {
-              UIHelperModule.toast('Vui lòng nhập tên hiển thị!', 'error');
-              return;
-            }
             const { data, error } = await supabaseClient.auth.signUp({
               email,
               password,
               options: { data: { name } }
             });
-            if (error) {
-              UIHelperModule.toast(error.message, 'error');
+            if (error) throw error;
+
+            if (!data.session) {
+              UIHelperModule.toast('Đã tạo yêu cầu đăng ký. Hãy mở email để xác nhận tài khoản, sau đó quay lại đăng nhập.', 'success');
               return;
             }
-            if (data.session) {
-              await StorageModule.syncUserData();
-              UIHelperModule.toast('Đăng ký thành công! Chào mừng ' + name, 'success');
-            } else {
-              UIHelperModule.toast('Đăng ký thành công! Vui lòng kiểm tra email xác nhận hoặc đăng nhập.', 'success');
+
+            const profileReady = await StorageModule.syncUserData();
+            if (!profileReady || !this.getCurrentUser()) {
+              UIHelperModule.toast('Tài khoản Auth đã tạo nhưng hồ sơ cửa hàng chưa được tạo. Cần cài trigger tạo hồ sơ trong Supabase rồi đăng nhập lại.', 'error');
+              return;
             }
+            UIHelperModule.toast('Đăng ký thành công! Chào mừng ' + name, 'success');
           } else {
-            const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
-            if (error) {
-              UIHelperModule.toast('Sai email hoặc mật khẩu!', 'error');
+            const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
+            if (error) throw error;
+
+            const profileReady = await StorageModule.syncUserData();
+            if (!profileReady || !this.getCurrentUser()) {
+              UIHelperModule.toast('Đăng nhập Auth thành công nhưng chưa tìm thấy hồ sơ trong shop. Cần tạo hồ sơ bằng trigger Supabase trước khi sử dụng.', 'error');
               return;
             }
-            await StorageModule.syncUserData();
-            if (this.getCurrentUser()) {
-              UIHelperModule.toast('Đăng nhập thành công!', 'success');
-            }
+            UIHelperModule.toast('Đăng nhập thành công!', 'success');
           }
 
           UIHelperModule.closeModal('auth-modal');
           this.syncHeaderUI();
           CatalogModule.renderProducts();
           CatalogModule.handleExchangeInput();
+        } catch (error) {
+          console.error('[Shop Phạm Nhật] Lỗi xác thực:', error);
+          const msg = String(error?.message || 'Không thể xác thực lúc này.');
+          if (/invalid login credentials/i.test(msg)) {
+            UIHelperModule.toast('Email hoặc mật khẩu không chính xác.', 'error');
+          } else if (/email not confirmed/i.test(msg)) {
+            UIHelperModule.toast('Email chưa được xác nhận. Hãy kiểm tra hộp thư đến/spam.', 'error');
+          } else if (/already registered|user already registered/i.test(msg)) {
+            UIHelperModule.toast('Email này đã đăng ký. Hãy chuyển sang tab Đăng Nhập.', 'error');
+          } else {
+            UIHelperModule.toast(msg, 'error');
+          }
         } finally {
           submitBtn.disabled = false;
           submitBtn.textContent = this.mode === 'register' ? 'Tạo Tài Khoản' : 'Đăng Nhập Ngay';
@@ -2159,7 +2215,7 @@
         const users = StorageModule.getUsers();
         const q = this.userSearchQuery.toLowerCase();
         const filtered = users.filter(u =>
-          u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q)
+          (u.name || '').toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q)
         );
 
         area.innerHTML = `
@@ -2187,7 +2243,7 @@
                       ${isAdmin ? '<span class="px-2 py-0.5 rounded bg-amber-500 text-slate-950 font-black text-[10px]">ADMIN</span>' : ''}
                       ${u.banned ? '<span class="px-2 py-0.5 rounded bg-rose-600 text-white font-black text-[10px]">ĐÃ BỊ BAN</span>' : ''}
                     </div>
-                    <div class="text-slate-400">TK: <span class="text-slate-200">${u.email}</span> • Ví: <strong class="text-emerald-400">${UIHelperModule.formatMoney(u.balance)}</strong> • Đã tiêu: ${UIHelperModule.formatMoney(u.totalSpent)}</div>
+                    <div class="text-slate-400">TK: <span class="text-slate-200">${u.email || 'Không công khai'}</span> • Ví: <strong class="text-emerald-400">${UIHelperModule.formatMoney(u.balance)}</strong> • Đã tiêu: ${UIHelperModule.formatMoney(u.totalSpent)}</div>
                   </div>
                   ${!isAdmin ? `
                     <button onclick="AdminModule.toggleBanUser('${u.id}')" class="px-3 py-1.5 rounded-xl font-bold text-xs ${u.banned ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-rose-600 hover:bg-rose-500 text-white'}">
